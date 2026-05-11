@@ -51,6 +51,25 @@
   - 完整 `run_conversation()` 对话流
   - failed built-in write 不得 bridge 外部 memory provider
 
+### 已验证
+
+在补丁作者本地环境中，已运行一组**定向回归测试**，覆盖：
+
+- memory overflow helper 行为
+- `_invoke_tool(...)` 入口
+- sequential tool-call 入口
+- `run_conversation()` 完整对话流
+- external memory provider bridge 合约
+- background review / switch_model 相邻回归面
+
+对应命令见下方 `Suggested tests` 小节，实测结果为：
+
+```text
+85 passed
+```
+
+注意：这里说明的是**memory overflow 相关定向回归集通过**，不是 Hermes 全量测试套件全部通过。
+
 ---
 
 ## What this patch changes
@@ -96,6 +115,27 @@ Use the project venv if present:
 .venv/bin/python -m pytest tests/run_agent/test_run_agent.py -q -k 'memory_overflow or run_conversation_memory_overflow_cleanup_retry_then_final_answer'
 .venv/bin/python -m pytest tests/run_agent/test_memory_overflow_recovery.py tests/agent/test_memory_provider.py tests/run_agent/test_background_review.py tests/run_agent/test_run_agent.py -q -k 'memory or background_review or switch_model or run_conversation_memory_overflow_cleanup_retry_then_final_answer'
 ```
+
+### Tests passed in the patch author's environment
+
+The following targeted regression set was run successfully while preparing this patch:
+
+```bash
+.venv/bin/python -m pytest \
+  tests/run_agent/test_memory_overflow_recovery.py \
+  tests/agent/test_memory_provider.py \
+  tests/run_agent/test_background_review.py \
+  tests/run_agent/test_run_agent.py \
+  -q -k 'memory or background_review or switch_model or run_conversation_memory_overflow_cleanup_retry_then_final_answer'
+```
+
+Observed result:
+
+```text
+85 passed
+```
+
+Important: this confirms the focused memory-overflow regression slice, **not** the entire Hermes test suite.
 
 Fallback:
 
