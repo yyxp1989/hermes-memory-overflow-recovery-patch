@@ -1,0 +1,736 @@
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -4050,6 +4050,188 @@
+         "genuinely nothing stands out on either, say 'Nothing to save.' "
+         "and stop — but don't reach for that conclusion as a default."
+     )
++
++    _MEMORY_OVERFLOW_REVIEW_PROMPT = (
++        "Persistent memory is full and a new memory write just failed.\n\n"
++        "Your ONLY task is to free enough room in the specified memory store so the pending "
++        "new entry can be saved. Use the memory tool to remove stale/low-value entries, merge "
++        "overlapping entries with replace, and shorten overlong entries.\n\n"
++        "Rules:\n"
++        "1. Operate ONLY on the specified store (memory or user).\n"
++        "2. Do NOT save unrelated new facts.\n"
++        "3. Prefer preserving durable, high-value facts; remove stale or redundant ones first.\n"
++        "4. Stop once you have made a best effort to create room for the pending entry."
++    )
++
++    @staticmethod
++    def _parse_tool_json_result(result: Any) -> Dict[str, Any]:
++        """Best-effort parse for JSON tool results."""
++        if isinstance(result, dict):
++            return result
++        if not isinstance(result, str):
++            return {}
++        try:
++            parsed = json.loads(result)
++        except (json.JSONDecodeError, TypeError):
++            return {}
++        return parsed if isinstance(parsed, dict) else {}
++
++    @classmethod
++    def _is_memory_overflow_result(cls, result: Any) -> bool:
++        """Return True when a memory-tool payload is the bounded-store overflow error."""
++        data = cls._parse_tool_json_result(result)
++        if data.get("success") is not False:
++            return False
++        error = str(data.get("error") or "")
++        return (
++            "would exceed the limit" in error
++            and "Replace or remove existing entries first" in error
++            and isinstance(data.get("current_entries"), list)
++        )
++
++    def _bridge_memory_write_if_success(
++        self,
++        *,
++        action: str,
++        target: str,
++        content: str,
++        effective_task_id: str,
++        tool_call_id: Optional[str],
++        function_result: Any,
++    ) -> None:
++        """Notify external memory providers only after a successful built-in write."""
++        if not self._memory_manager or action not in ("add", "replace"):
++            return
++        data = self._parse_tool_json_result(function_result)
++        if not data.get("success"):
++            return
++        try:
++            self._memory_manager.on_memory_write(
++                action,
++                target,
++                content,
++                metadata=self._build_memory_write_metadata(
++                    task_id=effective_task_id,
++                    tool_call_id=tool_call_id,
++                ),
++            )
++        except Exception:
++            pass
++
++    def _run_memory_overflow_cleanup(
++        self,
++        *,
++        target: str,
++        pending_content: str,
++        overflow_result: Any,
++        messages_snapshot: Optional[List[Dict]] = None,
++    ) -> None:
++        """Synchronously run a memory-only cleanup pass after overflow."""
++        import contextlib
++
++        data = self._parse_tool_json_result(overflow_result)
++        entries = data.get("current_entries") or []
++        rendered_entries = "\n".join(f"- {entry}" for entry in entries)
++        prompt = (
++            f"{self._MEMORY_OVERFLOW_REVIEW_PROMPT}\n\n"
++            f"Target store: {target}\n"
++            f"Current usage: {data.get('usage', '')}\n\n"
++            f"Pending new entry that failed to save:\n{pending_content}\n\n"
++            f"Current entries:\n{rendered_entries if rendered_entries else '- (empty)'}"
++        )
++
++        review_agent = None
++        try:
++            with open(os.devnull, "w", encoding="utf-8") as _devnull, \
++                 contextlib.redirect_stdout(_devnull), \
++                 contextlib.redirect_stderr(_devnull):
++                _parent_runtime = self._current_main_runtime()
++                review_agent = AIAgent(
++                    model=self.model,
++                    max_iterations=12,
++                    quiet_mode=True,
++                    platform=self.platform,
++                    provider=self.provider,
++                    api_mode=_parent_runtime.get("api_mode") or None,
++                    base_url=_parent_runtime.get("base_url") or None,
++                    api_key=_parent_runtime.get("api_key") or None,
++                    credential_pool=getattr(self, "_credential_pool", None),
++                    parent_session_id=self.session_id,
++                    enabled_toolsets=["memory"],
++                )
++                review_agent._memory_write_origin = "overflow_cleanup"
++                review_agent._memory_write_context = "overflow_cleanup"
++                review_agent._memory_store = self._memory_store
++                review_agent._memory_enabled = self._memory_enabled
++                review_agent._user_profile_enabled = self._user_profile_enabled
++                review_agent._memory_nudge_interval = 0
++                review_agent._skill_nudge_interval = 0
++                review_agent.suppress_status_output = True
++                review_agent.run_conversation(
++                    user_message=prompt,
++                    conversation_history=list(messages_snapshot or []),
++                )
++        except Exception as exc:
++            logger.warning("Memory overflow cleanup failed: %s", exc)
++        finally:
++            if review_agent is not None:
++                try:
++                    review_agent.shutdown_memory_provider()
++                except Exception:
++                    pass
++                try:
++                    review_agent.close()
++                except Exception:
++                    pass
++
++    def _execute_memory_tool_with_overflow_recovery(
++        self,
++        *,
++        function_args: dict,
++        effective_task_id: str,
++        tool_call_id: Optional[str] = None,
++        messages: Optional[List[Dict]] = None,
++    ) -> str:
++        """Execute built-in memory tool with overflow cleanup + single retry."""
++        target = function_args.get("target", "memory")
++        action = function_args.get("action")
++        content = function_args.get("content")
++        old_text = function_args.get("old_text")
++
++        from tools.memory_tool import memory_tool as _memory_tool
++
++        function_result = _memory_tool(
++            action=action,
++            target=target,
++            content=content,
++            old_text=old_text,
++            store=self._memory_store,
++        )
++
++        if action == "add" and self._is_memory_overflow_result(function_result):
++            self._run_memory_overflow_cleanup(
++                target=target,
++                pending_content=content or "",
++                overflow_result=function_result,
++                messages_snapshot=messages,
++            )
++            function_result = _memory_tool(
++                action=action,
++                target=target,
++                content=content,
++                old_text=old_text,
++                store=self._memory_store,
++            )
++
++        self._bridge_memory_write_if_success(
++            action=action or "",
++            target=target,
++            content=content or "",
++            effective_task_id=effective_task_id,
++            tool_call_id=tool_call_id,
++            function_result=function_result,
++        )
++        return function_result
+ 
+     @staticmethod
+     def _summarize_background_review_actions(
+@@ -10288,30 +10470,12 @@
+                 current_session_id=self.session_id,
+             )
+         elif function_name == "memory":
+-            target = function_args.get("target", "memory")
+-            from tools.memory_tool import memory_tool as _memory_tool
+-            result = _memory_tool(
+-                action=function_args.get("action"),
+-                target=target,
+-                content=function_args.get("content"),
+-                old_text=function_args.get("old_text"),
+-                store=self._memory_store,
++            return self._execute_memory_tool_with_overflow_recovery(
++                function_args=function_args,
++                effective_task_id=effective_task_id,
++                tool_call_id=tool_call_id,
++                messages=messages,
+             )
+-            # Bridge: notify external memory provider of built-in memory writes
+-            if self._memory_manager and function_args.get("action") in ("add", "replace"):
+-                try:
+-                    self._memory_manager.on_memory_write(
+-                        function_args.get("action", ""),
+-                        target,
+-                        function_args.get("content", ""),
+-                        metadata=self._build_memory_write_metadata(
+-                            task_id=effective_task_id,
+-                            tool_call_id=tool_call_id,
+-                        ),
+-                    )
+-                except Exception:
+-                    pass
+-            return result
+         elif self._memory_manager and self._memory_manager.has_tool(function_name):
+             return self._memory_manager.handle_tool_call(function_name, function_args)
+         elif function_name == "clarify":
+@@ -10917,29 +11081,12 @@
+                 if self._should_emit_quiet_tool_messages():
+                     self._vprint(f"  {_get_cute_tool_message_impl('session_search', function_args, tool_duration, result=function_result)}")
+             elif function_name == "memory":
+-                target = function_args.get("target", "memory")
+-                from tools.memory_tool import memory_tool as _memory_tool
+-                function_result = _memory_tool(
+-                    action=function_args.get("action"),
+-                    target=target,
+-                    content=function_args.get("content"),
+-                    old_text=function_args.get("old_text"),
+-                    store=self._memory_store,
++                function_result = self._execute_memory_tool_with_overflow_recovery(
++                    function_args=function_args,
++                    effective_task_id=effective_task_id,
++                    tool_call_id=getattr(tool_call, "id", None),
++                    messages=messages,
+                 )
+-                # Bridge: notify external memory provider of built-in memory writes
+-                if self._memory_manager and function_args.get("action") in ("add", "replace"):
+-                    try:
+-                        self._memory_manager.on_memory_write(
+-                            function_args.get("action", ""),
+-                            target,
+-                            function_args.get("content", ""),
+-                            metadata=self._build_memory_write_metadata(
+-                                task_id=effective_task_id,
+-                                tool_call_id=getattr(tool_call, "id", None),
+-                            ),
+-                        )
+-                    except Exception:
+-                        pass
+                 tool_duration = time.time() - tool_start_time
+                 if self._should_emit_quiet_tool_messages():
+                     self._vprint(f"  {_get_cute_tool_message_impl('memory', function_args, tool_duration, result=function_result)}")
+--- a/tests/agent/test_memory_provider.py
++++ b/tests/agent/test_memory_provider.py
+@@ -936,6 +936,42 @@
+         mgr.on_memory_write("remove", "memory", "old fact")
+         assert p.memory_writes == [("remove", "memory", "old fact")]
+ 
++    def test_failed_builtin_memory_write_must_not_bridge(self):
++        """Regression guard for bounded-memory overflow / failed writes.
++
++        If built-in MEMORY.md rejects a write, external memory providers must
++        not receive on_memory_write, otherwise built-in and external stores
++        diverge.
++        """
++        import json
++        from run_agent import AIAgent
++
++        agent = object.__new__(AIAgent)
++        agent._memory_store = object()
++        agent._memory_manager = MagicMock()
++        agent._build_memory_write_metadata = MagicMock(return_value={"write_origin": "assistant_tool"})
++
++        result = json.dumps(
++            {
++                "success": False,
++                "error": "Memory at 499/500 chars. Adding this entry (20 chars) would exceed the limit. Replace or remove existing entries first.",
++                "current_entries": ["old fact"],
++                "usage": "499/500",
++            }
++        )
++
++        AIAgent._bridge_memory_write_if_success(
++            agent,
++            action="add",
++            target="memory",
++            content="new fact",
++            effective_task_id="task-1",
++            tool_call_id="call-1",
++            function_result=result,
++        )
++
++        agent._memory_manager.on_memory_write.assert_not_called()
++
+     def test_memory_manager_tool_injection_deduplicates(self):
+         """Memory manager tools already in self.tools (from plugin registry)
+         must not be appended again.  Duplicate function names cause 400 errors
+--- a/tests/run_agent/test_run_agent.py
++++ b/tests/run_agent/test_run_agent.py
+@@ -2203,6 +2203,136 @@
+         assert json.loads(result) == {"error": "Blocked"}
+         assert agent._turns_since_memory == 5
+ 
++    def test_sequential_memory_overflow_runs_cleanup_and_retries_once(self, agent_with_memory_tool, monkeypatch):
++        """Full sequential entrypoint: assistant tool call -> cleanup -> retry -> success."""
++        tool_call = _mock_tool_call(
++            name="memory",
++            arguments='{"action":"add","target":"memory","content":"new fact"}',
++            call_id="c1",
++        )
++        mock_msg = _mock_assistant_msg(content="", tool_calls=[tool_call])
++        messages = []
++        calls = []
++        bridge_calls = []
++
++        overflow = json.dumps(
++            {
++                "success": False,
++                "error": "Memory at 499/500 chars. Adding this entry (20 chars) would exceed the limit. Replace or remove existing entries first.",
++                "current_entries": ["old fact", "stale fact"],
++                "usage": "499/500",
++            }
++        )
++        success = json.dumps(
++            {
++                "success": True,
++                "target": "memory",
++                "entries": ["trimmed fact", "new fact"],
++                "usage": "480/500",
++                "entry_count": 2,
++                "message": "Entry added.",
++            }
++        )
++
++        def fake_memory_tool(*, action, target, content=None, old_text=None, store=None):
++            calls.append((action, target, content, old_text, store))
++            return overflow if len(calls) == 1 else success
++
++        monkeypatch.setattr("tools.memory_tool.memory_tool", fake_memory_tool)
++        agent_with_memory_tool._run_memory_overflow_cleanup = MagicMock()
++        agent_with_memory_tool._memory_manager = MagicMock()
++        agent_with_memory_tool._memory_manager.prefetch_all.return_value = ""
++        agent_with_memory_tool._memory_manager.on_memory_write.side_effect = (
++            lambda action, target, content, metadata=None: bridge_calls.append((action, target, content, metadata))
++        )
++
++        agent_with_memory_tool._execute_tool_calls_sequential(mock_msg, messages, "task-1")
++
++        agent_with_memory_tool._run_memory_overflow_cleanup.assert_called_once()
++        assert len(calls) == 2
++        assert len(messages) == 1
++        assert json.loads(messages[0]["content"])["success"] is True
++        assert len(bridge_calls) == 1
++        assert bridge_calls[0][0:3] == ("add", "memory", "new fact")
++
++    def test_sequential_memory_overflow_failure_does_not_bridge(self, agent_with_memory_tool, monkeypatch):
++        """Full sequential entrypoint: final failed write must not notify external memory providers."""
++        tool_call = _mock_tool_call(
++            name="memory",
++            arguments='{"action":"add","target":"memory","content":"new fact"}',
++            call_id="c1",
++        )
++        mock_msg = _mock_assistant_msg(content="", tool_calls=[tool_call])
++        messages = []
++
++        overflow = json.dumps(
++            {
++                "success": False,
++                "error": "Memory at 499/500 chars. Adding this entry (20 chars) would exceed the limit. Replace or remove existing entries first.",
++                "current_entries": ["old fact"],
++                "usage": "499/500",
++            }
++        )
++
++        monkeypatch.setattr("tools.memory_tool.memory_tool", lambda **_kwargs: overflow)
++        agent_with_memory_tool._run_memory_overflow_cleanup = MagicMock()
++        agent_with_memory_tool._memory_manager = MagicMock()
++
++        agent_with_memory_tool._execute_tool_calls_sequential(mock_msg, messages, "task-1")
++
++        agent_with_memory_tool._run_memory_overflow_cleanup.assert_called_once()
++        agent_with_memory_tool._memory_manager.on_memory_write.assert_not_called()
++        assert len(messages) == 1
++        assert json.loads(messages[0]["content"])["success"] is False
++
++    def test_invoke_tool_memory_overflow_entrypoint_retries_and_bridges_once(self, agent_with_memory_tool, monkeypatch):
++        """Direct _invoke_tool entrypoint should share the same recovery behavior."""
++        calls = []
++        bridge_calls = []
++
++        overflow = json.dumps(
++            {
++                "success": False,
++                "error": "Memory at 499/500 chars. Adding this entry (20 chars) would exceed the limit. Replace or remove existing entries first.",
++                "current_entries": ["old fact"],
++                "usage": "499/500",
++            }
++        )
++        success = json.dumps(
++            {
++                "success": True,
++                "target": "memory",
++                "entries": ["new fact"],
++                "usage": "480/500",
++                "entry_count": 1,
++                "message": "Entry added.",
++            }
++        )
++
++        def fake_memory_tool(*, action, target, content=None, old_text=None, store=None):
++            calls.append((action, target, content, old_text, store))
++            return overflow if len(calls) == 1 else success
++
++        monkeypatch.setattr("tools.memory_tool.memory_tool", fake_memory_tool)
++        agent_with_memory_tool._run_memory_overflow_cleanup = MagicMock()
++        agent_with_memory_tool._memory_manager = MagicMock()
++        agent_with_memory_tool._memory_manager.prefetch_all.return_value = ""
++        agent_with_memory_tool._memory_manager.on_memory_write.side_effect = (
++            lambda action, target, content, metadata=None: bridge_calls.append((action, target, content, metadata))
++        )
++
++        result = agent_with_memory_tool._invoke_tool(
++            "memory",
++            {"action": "add", "target": "memory", "content": "new fact"},
++            "task-1",
++            tool_call_id="call-1",
++        )
++
++        assert json.loads(result)["success"] is True
++        agent_with_memory_tool._run_memory_overflow_cleanup.assert_called_once()
++        assert len(calls) == 2
++        assert len(bridge_calls) == 1
++
+ 
+ class TestPathsOverlap:
+     """Unit tests for the _paths_overlap helper."""
+@@ -2493,6 +2623,68 @@
+         assert result["api_calls"] == 2
+         assert mock_handle_function_call.call_args.kwargs["tool_call_id"] == "c1"
+         assert mock_handle_function_call.call_args.kwargs["session_id"] == agent.session_id
++
++    def test_run_conversation_memory_overflow_cleanup_retry_then_final_answer(self, agent_with_memory_tool, monkeypatch):
++        """Full conversation loop: model tool-call -> overflow -> cleanup -> retry -> final answer."""
++        self._setup_agent(agent_with_memory_tool)
++        tc = _mock_tool_call(
++            name="memory",
++            arguments='{"action":"add","target":"memory","content":"new fact"}',
++            call_id="c1",
++        )
++        resp1 = _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc])
++        resp2 = _mock_response(content="Saved after cleanup", finish_reason="stop")
++        agent_with_memory_tool.client.chat.completions.create.side_effect = [resp1, resp2]
++
++        calls = []
++        bridge_calls = []
++        overflow = json.dumps(
++            {
++                "success": False,
++                "error": "Memory at 499/500 chars. Adding this entry (20 chars) would exceed the limit. Replace or remove existing entries first.",
++                "current_entries": ["old fact", "stale fact"],
++                "usage": "499/500",
++            }
++        )
++        success = json.dumps(
++            {
++                "success": True,
++                "target": "memory",
++                "entries": ["trimmed fact", "new fact"],
++                "usage": "480/500",
++                "entry_count": 2,
++                "message": "Entry added.",
++            }
++        )
++
++        def fake_memory_tool(*, action, target, content=None, old_text=None, store=None):
++            calls.append((action, target, content, old_text, store))
++            return overflow if len(calls) == 1 else success
++
++        monkeypatch.setattr("tools.memory_tool.memory_tool", fake_memory_tool)
++        agent_with_memory_tool._run_memory_overflow_cleanup = MagicMock()
++        agent_with_memory_tool._memory_manager = MagicMock()
++        agent_with_memory_tool._memory_manager.prefetch_all.return_value = ""
++        agent_with_memory_tool._memory_manager.on_memory_write.side_effect = (
++            lambda action, target, content, metadata=None: bridge_calls.append((action, target, content, metadata))
++        )
++
++        with (
++            patch.object(agent_with_memory_tool, "_persist_session"),
++            patch.object(agent_with_memory_tool, "_save_trajectory"),
++            patch.object(agent_with_memory_tool, "_cleanup_task_resources"),
++        ):
++            result = agent_with_memory_tool.run_conversation("remember this")
++
++        assert result["final_response"] == "Saved after cleanup"
++        assert result["completed"] is True
++        assert result["api_calls"] == 2
++        agent_with_memory_tool._run_memory_overflow_cleanup.assert_called_once()
++        assert len(calls) == 2
++        assert len(bridge_calls) == 1
++        tool_msgs = [m for m in result["messages"] if m.get("role") == "tool"]
++        assert len(tool_msgs) == 1
++        assert json.loads(tool_msgs[0]["content"])["success"] is True
+ 
+     def test_request_scoped_api_hooks_fire_for_each_api_call(self, agent):
+         self._setup_agent(agent)
+--- a/tests/run_agent/test_memory_overflow_recovery.py
++++ b/tests/run_agent/test_memory_overflow_recovery.py
+@@ -0,0 +1,218 @@
++"""Regression tests for built-in memory overflow recovery.
++
++These tests lock in the desired runtime behavior for issue #23378:
++- when built-in memory add() overflows, the agent should run a dedicated
++  cleanup pass and retry the add once;
++- if the retry still fails, the original overflow should surface;
++- failed built-in writes must NOT be bridged to external memory providers.
++"""
++
++from __future__ import annotations
++
++import json
++from types import SimpleNamespace
++from unittest.mock import MagicMock
++
++import pytest
++
++import run_agent as run_agent_module
++from run_agent import AIAgent
++
++
++@pytest.fixture()
++def bare_agent():
++    agent = object.__new__(AIAgent)
++    agent._memory_store = object()
++    agent._memory_manager = MagicMock()
++    agent._memory_manager.on_memory_write = MagicMock()
++    agent._build_memory_write_metadata = MagicMock(return_value={"write_origin": "assistant_tool"})
++    agent._memory_enabled = True
++    agent._user_profile_enabled = True
++    agent.model = "fake-model"
++    agent.provider = "fake-provider"
++    agent.platform = "cli"
++    agent.base_url = ""
++    agent.api_key = ""
++    agent.api_mode = ""
++    agent.session_id = "sess-1"
++    agent._credential_pool = None
++    agent.background_review_callback = None
++    agent.suppress_status_output = True
++    agent.quiet_mode = True
++    agent.verbose_logging = False
++    agent._print_fn = print
++    agent._safe_print = lambda *_a, **_k: None
++    agent._current_main_runtime = lambda: {
++        "api_mode": "chat_completions",
++        "base_url": "",
++        "api_key": "",
++    }
++    agent._MEMORY_REVIEW_PROMPT = "review memory"
++    agent._SKILL_REVIEW_PROMPT = "review skills"
++    agent._COMBINED_REVIEW_PROMPT = "review both"
++    return agent
++
++
++def _overflow_result(entries=None, usage="499/500"):
++    return {
++        "success": False,
++        "error": (
++            "Memory at 499/500 chars. Adding this entry (20 chars) would exceed the limit. "
++            "Replace or remove existing entries first."
++        ),
++        "current_entries": entries or ["old fact", "stale fact"],
++        "usage": usage,
++    }
++
++
++def _success_result(message="Entry added."):
++    return {
++        "success": True,
++        "target": "memory",
++        "entries": ["trimmed fact", "new fact"],
++        "usage": "480/500",
++        "entry_count": 2,
++        "message": message,
++    }
++
++
++class FakeCleanupReviewAgent:
++    instances: list["FakeCleanupReviewAgent"] = []
++
++    def __init__(self, **kwargs):
++        self.kwargs = kwargs
++        self._session_messages = []
++        self.run_calls = []
++        FakeCleanupReviewAgent.instances.append(self)
++
++    def run_conversation(self, **kwargs):
++        self.run_calls.append(kwargs)
++        self._session_messages = [
++            {
++                "role": "tool",
++                "tool_call_id": "cleanup-1",
++                "content": json.dumps(
++                    {"success": True, "message": "Entry replaced.", "target": "memory"}
++                ),
++            }
++        ]
++
++    def shutdown_memory_provider(self):
++        pass
++
++    def close(self):
++        pass
++
++
++class ImmediateThread:
++    def __init__(self, *, target, daemon=None, name=None):
++        self._target = target
++
++    def start(self):
++        self._target()
++
++
++# ---------------------------------------------------------------------------
++# RED tests: expected behavior after the fix
++# ---------------------------------------------------------------------------
++
++
++def test_invoke_tool_memory_overflow_triggers_cleanup_and_retries_once(bare_agent, monkeypatch):
++    calls = []
++
++    def fake_memory_tool(*, action, target, content=None, old_text=None, store=None):
++        calls.append({
++            "action": action,
++            "target": target,
++            "content": content,
++            "old_text": old_text,
++            "store": store,
++        })
++        if len(calls) == 1:
++            return json.dumps(_overflow_result())
++        if len(calls) == 2:
++            return json.dumps(_success_result())
++        raise AssertionError(f"unexpected extra memory tool call #{len(calls)}")
++
++    monkeypatch.setattr("tools.memory_tool.memory_tool", fake_memory_tool)
++    monkeypatch.setattr(run_agent_module, "AIAgent", FakeCleanupReviewAgent)
++    monkeypatch.setattr(run_agent_module.threading, "Thread", ImmediateThread)
++
++    result = bare_agent._invoke_tool(
++        "memory",
++        {"action": "add", "target": "memory", "content": "new fact"},
++        effective_task_id="task-1",
++        tool_call_id="call-1",
++    )
++
++    data = json.loads(result)
++    assert data["success"] is True
++    assert len(calls) == 2, "memory add should be retried exactly once after cleanup"
++    assert FakeCleanupReviewAgent.instances, "overflow should spawn a dedicated cleanup review"
++    assert bare_agent._memory_manager.on_memory_write.call_count == 1
++
++
++
++def test_invoke_tool_memory_overflow_surfaces_error_when_retry_still_fails(bare_agent, monkeypatch):
++    calls = []
++
++    def fake_memory_tool(*, action, target, content=None, old_text=None, store=None):
++        calls.append((action, target, content, old_text))
++        return json.dumps(_overflow_result())
++
++    monkeypatch.setattr("tools.memory_tool.memory_tool", fake_memory_tool)
++    monkeypatch.setattr(run_agent_module, "AIAgent", FakeCleanupReviewAgent)
++    monkeypatch.setattr(run_agent_module.threading, "Thread", ImmediateThread)
++
++    result = bare_agent._invoke_tool(
++        "memory",
++        {"action": "add", "target": "memory", "content": "new fact"},
++        effective_task_id="task-1",
++        tool_call_id="call-1",
++    )
++
++    data = json.loads(result)
++    assert data["success"] is False
++    assert "would exceed the limit" in data["error"]
++    assert len(calls) == 2, "should retry once even if cleanup could not make room"
++    bare_agent._memory_manager.on_memory_write.assert_not_called()
++
++
++
++def test_invoke_tool_failed_memory_add_does_not_bridge_external_provider(bare_agent, monkeypatch):
++    monkeypatch.setattr(
++        "tools.memory_tool.memory_tool",
++        lambda **_kwargs: json.dumps(_overflow_result()),
++    )
++    monkeypatch.setattr(run_agent_module, "AIAgent", FakeCleanupReviewAgent)
++    monkeypatch.setattr(run_agent_module.threading, "Thread", ImmediateThread)
++
++    result = bare_agent._invoke_tool(
++        "memory",
++        {"action": "add", "target": "memory", "content": "new fact"},
++        effective_task_id="task-1",
++        tool_call_id="call-1",
++    )
++
++    assert json.loads(result)["success"] is False
++    bare_agent._memory_manager.on_memory_write.assert_not_called()
++
++
++
++def test_cleanup_review_is_memory_only_and_uses_shared_store(bare_agent, monkeypatch):
++    monkeypatch.setattr(
++        "tools.memory_tool.memory_tool",
++        lambda **_kwargs: json.dumps(_overflow_result()),
++    )
++    monkeypatch.setattr(run_agent_module, "AIAgent", FakeCleanupReviewAgent)
++    monkeypatch.setattr(run_agent_module.threading, "Thread", ImmediateThread)
++
++    bare_agent._invoke_tool(
++        "memory",
++        {"action": "add", "target": "memory", "content": "new fact"},
++        effective_task_id="task-1",
++        tool_call_id="call-1",
++    )
++
++    child = FakeCleanupReviewAgent.instances[-1]
++    assert child.kwargs["enabled_toolsets"] == ["memory"]
